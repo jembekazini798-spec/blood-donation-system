@@ -7,100 +7,538 @@ require('dotenv').config();
 
 const app = express();
 
-// Middleware
-app.use(cors({
-    origin: 'http://localhost:5173',
-    credentials: true
-}));
-app.use(express.json());
+// Check if we're on Render
+const isRender = process.env.RENDER === 'true';
+const isProduction = process.env.NODE_ENV === 'production';
 
-// Database connection pool
-const pool = mysql.createPool({
+console.log(`🚀 Starting Blood Donation Portal Server`);
+console.log(`🌐 Environment: ${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+console.log(`🌐 Platform: ${isRender ? 'RENDER' : 'LOCAL'}`);
+
+// CORS Configuration
+const corsOptions = {
+    origin: [
+        'http://localhost:5173',
+        'https://blood-management-portal.vercel.app',
+        'https://blood-management-portal.onrender.com'
+    ],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Handle preflight requests
+app.options('*', cors(corsOptions));
+
+// Database configuration
+const dbConfig = {
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'blood_donation_db',
+    port: parseInt(process.env.DB_PORT) || 3306,
+    ssl: isRender ? { rejectUnauthorized: false } : null,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
-});
+   
+};
 
-// Pre-hashed password for '1234'
+console.log('📊 Database Configuration:');
+console.log(`   Host: ${dbConfig.host}`);
+console.log(`   Port: ${dbConfig.port}`);
+console.log(`   Database: ${dbConfig.database}`);
+console.log(`   User: ${dbConfig.user}`);
+console.log(`   SSL: ${dbConfig.ssl ? 'Enabled' : 'Disabled'}`);
+
+let pool;
+let dbConnected = false;
+
+// Initialize database connection with intelligent retry logic
+const initializeDatabase = async () => {
+    const maxRetries = isRender ? 10 : 5;
+    let retryCount = 0;
+    let lastError = null;
+    
+    console.log(`🔄 Attempting database connection (max ${maxRetries} retries)...`);
+
+    while (retryCount < maxRetries) {
+        try {
+            retryCount++;
+            console.log(`🔌 Database connection attempt ${retryCount}/${maxRetries}...`);
+            
+            // Create new pool for each attempt
+            pool = mysql.createPool(dbConfig);
+            
+            // Test connection
+            const connection = await pool.getConnection();
+            await connection.ping();
+            
+            // Verify we can query
+            const [rows] = await connection.query('SELECT DATABASE() as db, NOW() as time');
+            connection.release();
+            
+            console.log(`✅ Database connected successfully!`);
+            console.log(`   Database: ${rows[0].db}`);
+            console.log(`   Server Time: ${rows[0].time}`);
+            
+            dbConnected = true;
+            return true;
+            
+        } catch (error) {
+            lastError = error;
+            console.error(`❌ Attempt ${retryCount} failed: ${error.code || error.message}`);
+            
+            // Specific error handling
+            if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED') {
+                console.log(`   ⚠️ Network timeout/refused. This usually means:`);
+                console.log(`      1. IP not whitelisted in Aiven`);
+                console.log(`      2. Firewall blocking connection`);
+                console.log(`   💡 Solution: Add 0.0.0.0/0 to Aiven IP whitelist`);
+            } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
+                console.log(`   🔒 Access denied. Check username/password`);
+            } else if (error.code === 'ER_BAD_DB_ERROR') {
+                console.log(`   📊 Database doesn't exist`);
+            }
+            
+            // Clean up pool
+            if (pool) {
+                try {
+                    await pool.end();
+                } catch (e) {
+                    // Ignore cleanup errors
+                }
+                pool = null;
+            }
+            
+            if (retryCount < maxRetries) {
+                const delay = Math.min(retryCount * 3000, 10000);
+                console.log(`⏳ Waiting ${delay/1000} seconds before retry ${retryCount + 1}...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    console.error(`❌ All ${maxRetries} database connection attempts failed`);
+    console.error(`   Last error: ${lastError?.message}`);
+    console.error(`   Error code: ${lastError?.code}`);
+    
+    if (isRender) {
+        console.error(`\n🔧 FOR RENDER DEPLOYMENT FIX:`);
+        console.error(`   1. Go to Aiven Console: https://console.aiven.io/`);
+        console.error(`   2. Find your MySQL service`);
+        console.error(`   3. Click Settings → IP Filter`);
+        console.error(`   4. Add: 0.0.0.0/0 (allow all IPs)`);
+        console.error(`   5. Save and wait 2 minutes`);
+        console.error(`   6. Redeploy on Render\n`);
+    }
+    
+    dbConnected = false;
+    return false;
+};
+
+// Initialize database tables
+const initializeTables = async () => {
+    if (!dbConnected || !pool) {
+        console.log('⚠️ Skipping table creation - no database connection');
+        return false;
+    }
+
+    try {
+        console.log('📊 Creating/verifying database tables...');
+        
+        const tables = [
+            // Users table
+            `CREATE TABLE IF NOT EXISTS users (
+                user_id INT PRIMARY KEY AUTO_INCREMENT,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role ENUM('admin', 'donor', 'hospital') NOT NULL DEFAULT 'donor',
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_email (email),
+                INDEX idx_role (role)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+            
+            // Donors table
+            `CREATE TABLE IF NOT EXISTS donors (
+                donor_id INT PRIMARY KEY AUTO_INCREMENT,
+                user_id INT UNIQUE,
+                full_name VARCHAR(100) NOT NULL,
+                gender ENUM('male', 'female', 'other') DEFAULT 'male',
+                date_of_birth DATE,
+                blood_group VARCHAR(10),
+                phone VARCHAR(20),
+                email VARCHAR(100),
+                address TEXT,
+                availability_status ENUM('available', 'unavailable', 'recently_donated') DEFAULT 'available',
+                last_donation_date DATE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                INDEX idx_blood_group (blood_group),
+                INDEX idx_availability (availability_status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+            
+            // Hospitals table
+            `CREATE TABLE IF NOT EXISTS hospitals (
+                hospital_id INT PRIMARY KEY AUTO_INCREMENT,
+                user_id INT UNIQUE,
+                hospital_name VARCHAR(100) NOT NULL,
+                location VARCHAR(100),
+                contact_phone VARCHAR(20),
+                email VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                INDEX idx_location (location)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+            
+            // Blood requests table
+            `CREATE TABLE IF NOT EXISTS blood_requests (
+                request_id INT PRIMARY KEY AUTO_INCREMENT,
+                blood_group VARCHAR(10) NOT NULL,
+                quantity_units INT NOT NULL,
+                urgency_level ENUM('critical', 'high', 'medium', 'low') DEFAULT 'medium',
+                hospital_id INT,
+                status ENUM('pending', 'matched', 'fulfilled', 'cancelled') DEFAULT 'pending',
+                notes TEXT,
+                request_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                fulfilled_date DATE,
+                FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id) ON DELETE SET NULL,
+                INDEX idx_status (status),
+                INDEX idx_urgency (urgency_level)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+            
+            // Matching table
+            `CREATE TABLE IF NOT EXISTS matching (
+                match_id INT PRIMARY KEY AUTO_INCREMENT,
+                request_id INT,
+                donor_id INT,
+                match_status ENUM('pending', 'contacted', 'confirmed', 'completed', 'cancelled') DEFAULT 'pending',
+                match_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT,
+                FOREIGN KEY (request_id) REFERENCES blood_requests(request_id) ON DELETE CASCADE,
+                FOREIGN KEY (donor_id) REFERENCES donors(donor_id) ON DELETE CASCADE,
+                UNIQUE KEY unique_request_donor (request_id, donor_id),
+                INDEX idx_match_status (match_status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+            
+            // Donation history table
+            `CREATE TABLE IF NOT EXISTS donation_history (
+                donation_id INT PRIMARY KEY AUTO_INCREMENT,
+                donor_id INT,
+                request_id INT,
+                hospital_id INT,
+                donation_date DATE NOT NULL,
+                quantity_units INT DEFAULT 1,
+                notes TEXT,
+                FOREIGN KEY (donor_id) REFERENCES donors(donor_id) ON DELETE SET NULL,
+                FOREIGN KEY (request_id) REFERENCES blood_requests(request_id) ON DELETE SET NULL,
+                FOREIGN KEY (hospital_id) REFERENCES hospitals(hospital_id) ON DELETE SET NULL,
+                INDEX idx_donation_date (donation_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+        ];
+
+        for (const tableSql of tables) {
+            try {
+                await pool.execute(tableSql);
+            } catch (tableError) {
+                console.warn(`   ⚠️ Table creation note: ${tableError.message}`);
+            }
+        }
+        
+        console.log('✅ Database tables verified/created successfully');
+        return true;
+    } catch (error) {
+        console.error('❌ Error creating tables:', error.message);
+        return false;
+    }
+};
+
+// Admin user initialization
 const ADMIN_PASSWORD_HASH = '$2a$10$J7fggR9G8q8Q8Q8Q8Q8Q8OeQ8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8Q8';
 
-// Initialize admin user if not exists
 const initializeAdmin = async () => {
+    if (!dbConnected || !pool) {
+        console.log('⚠️ Skipping admin initialization - no database connection');
+        return;
+    }
+
     try {
+        console.log('👨‍💼 Checking for admin user...');
+        
         const [existingAdmin] = await pool.execute(
             'SELECT user_id FROM users WHERE email = ?',
             ['seuripusindawa@gmail.com']
         );
-        
+
         if (existingAdmin.length === 0) {
             await pool.execute(
-                'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
-                ['seuri_admin', 'seuripusindawa@gmail.com', ADMIN_PASSWORD_HASH, 'admin']
+                'INSERT INTO users (username, email, password_hash, role, is_active) VALUES (?, ?, ?, ?, ?)',
+                ['seuri_admin', 'seuripusindawa@gmail.com', ADMIN_PASSWORD_HASH, 'admin', true]
             );
             console.log('✅ Admin user created: seuripusindawa@gmail.com (password: 1234)');
         } else {
             console.log('✅ Admin user already exists');
         }
     } catch (error) {
-        console.error('❌ Error initializing admin:', error);
+        console.error('❌ Error initializing admin:', error.message);
     }
 };
 
-// Call initialization
-initializeAdmin();
-
-// JWT Authentication middleware
-const authenticateToken = (roles = []) => {
+// Database middleware - handles missing database gracefully
+const dbMiddleware = (handler) => {
     return async (req, res, next) => {
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
-        if (!token) {
-            return res.status(401).json({ error: 'Access token required' });
+        if (!dbConnected || !pool) {
+            return res.status(503).json({
+                error: 'Database not available',
+                message: 'Database connection failed. Please check server logs.',
+                fix: isRender ? 'Add Render IP to Aiven whitelist (0.0.0.0/0)' : 'Check database configuration',
+                timestamp: new Date().toISOString()
+            });
         }
         try {
-            const user = jwt.verify(token, process.env.JWT_SECRET || 'blood_donation_secret_key_2024');
-            req.user = user;
-            
-            // Check role if specified
-            if (roles.length > 0 && !roles.includes(user.role)) {
-                return res.status(403).json({ error: 'Insufficient permissions' });
-            }
-            
-            next();
+            await handler(req, res, next);
         } catch (error) {
-            return res.status(403).json({ error: 'Invalid token' });
+            console.error('Database error in route:', error.message);
+            res.status(500).json({
+                error: 'Database operation failed',
+                message: error.message,
+                timestamp: new Date().toISOString()
+            });
         }
     };
 };
 
-// Test database connection
-app.get('/api/test-db', async (req, res) => {
+// JWT Authentication middleware
+const authenticateToken = (roles = []) => {
+    return async (req, res, next) => {
+        try {
+            const authHeader = req.headers['authorization'];
+            const token = authHeader && authHeader.split(' ')[1];
+            
+            if (!token) {
+                return res.status(401).json({ error: 'Access token required' });
+            }
+
+            const user = jwt.verify(token, process.env.JWT_SECRET || 'blood_donation_secret_key_2024');
+            req.user = user;
+
+            if (roles.length > 0 && !roles.includes(user.role)) {
+                return res.status(403).json({ error: 'Insufficient permissions' });
+            }
+
+            next();
+        } catch (error) {
+            console.error('Token verification error:', error.message);
+            return res.status(403).json({ error: 'Invalid or expired token' });
+        }
+    };
+};
+
+// Initialize application
+const initializeApp = async () => {
+    console.log('\n============================================');
+    
+    // Try to connect to database (non-blocking)
+    initializeDatabase().then(async (connected) => {
+        if (connected) {
+            await initializeTables();
+            await initializeAdmin();
+        } else {
+            console.log('\n⚠️ Application running with limited functionality');
+            console.log('   Database-dependent features will not work');
+            console.log('   API endpoints will return database errors');
+        }
+    }).catch(error => {
+        console.error('Database initialization error:', error);
+    });
+    
+    // Start server immediately (don't wait for database)
+    const PORT = process.env.PORT || 10000;
+    const HOST = isProduction ? '0.0.0.0' : 'localhost';
+    
+    app.listen(PORT, HOST, () => {
+        console.log(`\n🎉 ============================================`);
+        console.log(`🚀 Server running on http://${HOST}:${PORT}`);
+        console.log(`🌐 Backend URL: https://blood-management-portal.onrender.com`);
+        console.log(`🌐 Frontend URL: https://blood-management-portal.vercel.app`);
+        console.log(`🌐 Health check: http://${HOST}:${PORT}/api/health`);
+        console.log(`🌐 Database: ${dbConnected ? '✅ Connected' : '❌ Not connected'}`);
+        console.log(`🎉 ============================================\n`);
+    });
+    
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+        console.log('SIGTERM received. Shutting down gracefully...');
+        if (pool) {
+            pool.end().then(() => {
+                console.log('Database pool closed');
+                process.exit(0);
+            });
+        } else {
+            process.exit(0);
+        }
+    });
+    
+    process.on('SIGINT', () => {
+        console.log('SIGINT received. Shutting down gracefully...');
+        if (pool) {
+            pool.end().then(() => {
+                console.log('Database pool closed');
+                process.exit(0);
+            });
+        } else {
+            process.exit(0);
+        }
+    });
+};
+
+// ============ API ROUTES ============
+
+// Health check (always works, even without database)
+app.get('/api/health', async (req, res) => {
     try {
-        const [rows] = await pool.execute('SELECT 1 as test');
-        res.json({ message: 'Database connected successfully', data: rows });
+        if (dbConnected && pool) {
+            await pool.execute('SELECT 1');
+            res.json({
+                status: 'healthy',
+                service: 'Blood Donation Portal API',
+                backend: 'running',
+                database: 'connected',
+                timestamp: new Date().toISOString(),
+                environment: isProduction ? 'production' : 'development',
+                platform: isRender ? 'render' : 'local'
+            });
+        } else {
+            res.json({
+                status: 'degraded',
+                service: 'Blood Donation Portal API',
+                backend: 'running',
+                database: 'disconnected',
+                timestamp: new Date().toISOString(),
+                environment: isProduction ? 'production' : 'development',
+                platform: isRender ? 'render' : 'local',
+                message: 'Database not connected. API will have limited functionality.',
+                fix: isRender ? 'Add Render IP to Aiven whitelist' : 'Check database configuration'
+            });
+        }
     } catch (error) {
-        console.error('Database connection error:', error);
-        res.status(500).json({ error: 'Database connection failed' });
+        res.json({
+            status: 'unhealthy',
+            service: 'Blood Donation Portal API',
+            backend: 'running',
+            database: 'error',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
     }
 });
 
+// Welcome endpoint
+app.get('/api', (req, res) => {
+    res.json({
+        message: 'Welcome to Blood Donation Portal API',
+        version: '1.0.0',
+        status: 'operational',
+        database: dbConnected ? 'connected' : 'disconnected',
+        endpoints: {
+            auth: '/api/auth/*',
+            donors: '/api/donors/*',
+            hospitals: '/api/hospitals/*',
+            requests: '/api/blood-requests/*',
+            admin: '/api/admin/*',
+            profile: '/api/profile',
+            health: '/api/health',
+            test: '/api/test',
+            debug: '/api/debug'
+        },
+        frontend: 'https://blood-management-portal.vercel.app',
+        documentation: 'See README for API details'
+    });
+});
+
+// Test endpoint
+app.get('/api/test', (req, res) => {
+    res.json({
+        success: true,
+        message: 'API is fully operational!',
+        timestamp: new Date().toISOString(),
+        database: dbConnected ? 'connected' : 'disconnected',
+        urls: {
+            frontend: 'https://blood-management-portal.vercel.app',
+            backend: 'https://blood-management-portal.onrender.com',
+            local: 'http://localhost:5173'
+        }
+    });
+});
+
+// Database test endpoint
+app.get('/api/test-db', dbMiddleware(async (req, res) => {
+    try {
+        const [rows] = await pool.execute('SELECT 1 as test, NOW() as server_time, DATABASE() as db_name');
+        res.json({
+            success: true,
+            message: 'Database connected successfully',
+            data: rows[0],
+            timestamp: new Date().toISOString(),
+            environment: isProduction ? 'production' : 'development'
+        });
+    } catch (error) {
+        console.error('Database test error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Database connection failed',
+            details: error.message,
+            code: error.code,
+            timestamp: new Date().toISOString(),
+            fix: isRender ? 'Add 0.0.0.0/0 to Aiven IP whitelist' : 'Check database configuration'
+        });
+    }
+}));
+
+// Debug endpoint
+app.get('/api/debug', (req, res) => {
+    res.json({
+        environment: process.env.NODE_ENV || 'development',
+        platform: isRender ? 'render' : 'local',
+        dbConnected: dbConnected,
+        dbConfig: {
+            host: process.env.DB_HOST ? 'Set' : 'Not set',
+            database: process.env.DB_NAME ? 'Set' : 'Not set',
+            port: process.env.DB_PORT ? 'Set' : 'Not set',
+            user: process.env.DB_USER ? 'Set' : 'Not set'
+        },
+        timestamp: new Date().toISOString(),
+        renderSpecific: isRender ? {
+            fix: 'Add 0.0.0.0/0 to Aiven IP whitelist',
+            steps: [
+                '1. Go to Aiven Console: https://console.aiven.io/',
+                '2. Find your MySQL service',
+                '3. Click Settings → IP Filter',
+                '4. Add: 0.0.0.0/0',
+                '5. Save and wait 2 minutes',
+                '6. Redeploy on Render'
+            ]
+        } : null
+    });
+});
+
 // 1. Authentication Routes
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', dbMiddleware(async (req, res) => {
     try {
         const { username, email, password, role, userData } = req.body;
         
         console.log('Registration attempt:', { username, email, role });
         
-        // Validate required fields
         if (!username || !email || !password || !role) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
 
-        // Check if user exists
         const [existingUsers] = await pool.execute(
             'SELECT user_id FROM users WHERE email = ? OR username = ?',
             [email, username]
@@ -110,23 +548,19 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
 
-        // Hash password
         const salt = await bcrypt.genSalt(10);
         const passwordHash = await bcrypt.hash(password, salt);
 
-        // Start transaction
         const connection = await pool.getConnection();
         await connection.beginTransaction();
 
         try {
-            // Create user
             const [userResult] = await connection.execute(
                 'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
                 [username, email, passwordHash, role]
             );
             const userId = userResult.insertId;
 
-            // Create role-specific record with proper null handling
             if (role === 'donor' && userData) {
                 const donorData = {
                     full_name: userData.fullName || '',
@@ -134,7 +568,7 @@ app.post('/api/auth/register', async (req, res) => {
                     date_of_birth: userData.dateOfBirth || new Date().toISOString().split('T')[0],
                     blood_group: userData.bloodGroup || 'O+',
                     phone: userData.phone || '',
-                    email: email || '', // Use the main email
+                    email: email || '',
                     address: userData.address || ''
                 };
                 
@@ -149,7 +583,7 @@ app.post('/api/auth/register', async (req, res) => {
                     hospital_name: userData.hospitalName || '',
                     location: userData.location || '',
                     contact_phone: userData.contactPhone || '',
-                    email: email || '' // Use the main email
+                    email: email || ''
                 };
                 
                 await connection.execute(
@@ -163,7 +597,6 @@ app.post('/api/auth/register', async (req, res) => {
             await connection.commit();
             connection.release();
 
-            // Generate JWT token
             const token = jwt.sign(
                 { userId, username, email, role },
                 process.env.JWT_SECRET || 'blood_donation_secret_key_2024',
@@ -179,22 +612,21 @@ app.post('/api/auth/register', async (req, res) => {
             await connection.rollback();
             connection.release();
             console.error('Transaction error:', error);
-            throw error;
+            res.status(500).json({ error: 'Registration failed. Please try again.' });
         }
     } catch (error) {
         console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed. Please try again.' });
     }
-});
+}));
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', dbMiddleware(async (req, res) => {
     try {
         const { email, password } = req.body;
         if (!email || !password) {
             return res.status(400).json({ error: 'Email and password are required' });
         }
 
-        // Find user
         const [users] = await pool.execute(
             'SELECT user_id, username, email, password_hash, role FROM users WHERE email = ? AND is_active = TRUE',
             [email]
@@ -205,14 +637,11 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const user = users[0];
-
-        // Verify password
         const isValidPassword = await bcrypt.compare(password, user.password_hash);
         if (!isValidPassword) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
-        // Generate JWT token
         const token = jwt.sign(
             { userId: user.user_id, username: user.username, email: user.email, role: user.role },
             process.env.JWT_SECRET || 'blood_donation_secret_key_2024',
@@ -233,10 +662,10 @@ app.post('/api/auth/login', async (req, res) => {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
     }
-});
+}));
 
 // 2. ADMIN ROUTES
-app.get('/api/admin/users', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/users', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const [users] = await pool.execute(`
             SELECT u.*,
@@ -257,9 +686,9 @@ app.get('/api/admin/users', authenticateToken(['admin']), async (req, res) => {
         console.error('Get users error:', error);
         res.status(500).json({ error: 'Failed to fetch users' });
     }
-});
+}));
 
-app.put('/api/admin/users/:id/status', authenticateToken(['admin']), async (req, res) => {
+app.put('/api/admin/users/:id/status', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { is_active } = req.body;
         
@@ -273,9 +702,9 @@ app.put('/api/admin/users/:id/status', authenticateToken(['admin']), async (req,
         console.error('Update user status error:', error);
         res.status(500).json({ error: 'Failed to update user status' });
     }
-});
+}));
 
-app.delete('/api/admin/users/:id', authenticateToken(['admin']), async (req, res) => {
+app.delete('/api/admin/users/:id', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         await pool.execute('DELETE FROM users WHERE user_id = ?', [req.params.id]);
         res.json({ message: 'User deleted successfully' });
@@ -283,16 +712,16 @@ app.delete('/api/admin/users/:id', authenticateToken(['admin']), async (req, res
         console.error('Delete user error:', error);
         res.status(500).json({ error: 'Failed to delete user' });
     }
-});
+}));
 
 // 3. Dashboard Statistics Route
-app.get('/api/dashboard/stats', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/dashboard/stats', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const [
-            [totalDonors],
-            [totalHospitals],
-            [totalRequests],
-            [pendingRequests],
+            [[totalDonors]],
+            [[totalHospitals]],
+            [[totalRequests]],
+            [[pendingRequests]],
             bloodGroupStats
         ] = await Promise.all([
             pool.execute('SELECT COUNT(*) as count FROM donors'),
@@ -313,10 +742,10 @@ app.get('/api/dashboard/stats', authenticateToken(['admin']), async (req, res) =
         console.error('Get dashboard stats error:', error);
         res.status(500).json({ error: 'Failed to fetch dashboard statistics' });
     }
-});
+}));
 
 // 4. Donor Routes
-app.get('/api/donors', authenticateToken(['admin', 'hospital']), async (req, res) => {
+app.get('/api/donors', authenticateToken(['admin', 'hospital']), dbMiddleware(async (req, res) => {
     try {
         const { blood_group, availability, search } = req.query;
         let query = `SELECT d.* FROM donors d WHERE 1=1`;
@@ -344,9 +773,9 @@ app.get('/api/donors', authenticateToken(['admin', 'hospital']), async (req, res
         console.error('Get donors error:', error);
         res.status(500).json({ error: 'Failed to fetch donors' });
     }
-});
+}));
 
-app.get('/api/donors/:id', authenticateToken(), async (req, res) => {
+app.get('/api/donors/:id', authenticateToken(), dbMiddleware(async (req, res) => {
     try {
         const [donors] = await pool.execute(
             'SELECT * FROM donors WHERE donor_id = ?',
@@ -362,9 +791,9 @@ app.get('/api/donors/:id', authenticateToken(), async (req, res) => {
         console.error('Get donor error:', error);
         res.status(500).json({ error: 'Failed to fetch donor' });
     }
-});
+}));
 
-app.put('/api/donors/:id', authenticateToken(['donor', 'admin']), async (req, res) => {
+app.put('/api/donors/:id', authenticateToken(['donor', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const { availability_status, last_donation_date } = req.body;
         
@@ -397,10 +826,10 @@ app.put('/api/donors/:id', authenticateToken(['donor', 'admin']), async (req, re
         console.error('Update donor error:', error);
         res.status(500).json({ error: 'Failed to update donor' });
     }
-});
+}));
 
 // 5. Hospital Routes
-app.get('/api/hospitals', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/hospitals', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const [hospitals] = await pool.execute(`
             SELECT h.*,
@@ -417,10 +846,10 @@ app.get('/api/hospitals', authenticateToken(['admin']), async (req, res) => {
         console.error('Get hospitals error:', error);
         res.status(500).json({ error: 'Failed to fetch hospitals' });
     }
-});
+}));
 
 // 6. Blood Request Routes
-app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), async (req, res) => {
+app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const { blood_group, quantity_units, urgency_level, notes } = req.body;
         
@@ -430,7 +859,6 @@ app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), async 
         
         let hospitalId;
         
-        // Get hospital ID based on user role
         if (req.user.role === 'hospital') {
             const [hospitals] = await pool.execute(
                 'SELECT hospital_id FROM hospitals WHERE user_id = ?',
@@ -454,7 +882,6 @@ app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), async 
             [blood_group, quantity_units, urgency_level || 'medium', hospitalId, notes || '']
         );
         
-        // Automatically find matching donors
         const [matchingDonors] = await pool.execute(
             `SELECT donor_id FROM donors
              WHERE blood_group = ?
@@ -463,7 +890,6 @@ app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), async 
             [blood_group]
         );
         
-        // Create match records
         for (const donor of matchingDonors) {
             await pool.execute(
                 `INSERT INTO matching (request_id, donor_id) VALUES (?, ?)`,
@@ -479,9 +905,9 @@ app.post('/api/blood-requests', authenticateToken(['hospital', 'admin']), async 
         console.error('Create request error:', error);
         res.status(500).json({ error: 'Failed to create blood request' });
     }
-});
+}));
 
-app.get('/api/blood-requests', authenticateToken(), async (req, res) => {
+app.get('/api/blood-requests', authenticateToken(), dbMiddleware(async (req, res) => {
     try {
         let query = `SELECT br.*, h.hospital_name FROM blood_requests br
                      JOIN hospitals h ON br.hospital_id = h.hospital_id WHERE 1=1`;
@@ -513,10 +939,10 @@ app.get('/api/blood-requests', authenticateToken(), async (req, res) => {
         console.error('Get requests error:', error);
         res.status(500).json({ error: 'Failed to fetch blood requests' });
     }
-});
+}));
 
 // 7. Matching Routes
-app.get('/api/matches', authenticateToken(), async (req, res) => {
+app.get('/api/matches', authenticateToken(), dbMiddleware(async (req, res) => {
     try {
         let query = `SELECT m.*, br.blood_group, br.urgency_level,
                             d.full_name, d.phone, d.email,
@@ -546,9 +972,9 @@ app.get('/api/matches', authenticateToken(), async (req, res) => {
         console.error('Get matches error:', error);
         res.status(500).json({ error: 'Failed to fetch matches' });
     }
-});
+}));
 
-app.put('/api/matches/:id', authenticateToken(['donor', 'hospital', 'admin']), async (req, res) => {
+app.put('/api/matches/:id', authenticateToken(['donor', 'hospital', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const { match_status, notes } = req.body;
         
@@ -557,7 +983,6 @@ app.put('/api/matches/:id', authenticateToken(['donor', 'hospital', 'admin']), a
             [match_status || 'pending', notes || '', req.params.id]
         );
         
-        // If donor confirmed donation, update their status
         if (match_status === 'confirmed') {
             const [match] = await pool.execute(
                 `SELECT donor_id FROM matching WHERE match_id = ?`,
@@ -577,19 +1002,19 @@ app.put('/api/matches/:id', authenticateToken(['donor', 'hospital', 'admin']), a
         console.error('Update match error:', error);
         res.status(500).json({ error: 'Failed to update match' });
     }
-});
+}));
 
 // 8. Get current user's profile
-app.get('/api/profile', authenticateToken(), async (req, res) => {
+app.get('/api/profile', authenticateToken(), dbMiddleware(async (req, res) => {
     try {
         const userId = req.user.userId;
         const role = req.user.role;
         
         if (role === 'donor') {
             const [donors] = await pool.execute(
-                `SELECT d.*, 
-                   COUNT(DISTINCT dh.donation_id) as total_donations,
-                   MAX(dh.donation_date) as last_donation_date
+                `SELECT d.*,
+                       COUNT(DISTINCT dh.donation_id) as total_donations,
+                       MAX(dh.donation_date) as last_donation_date
                  FROM donors d
                  LEFT JOIN donation_history dh ON d.donor_id = dh.donor_id
                  WHERE d.user_id = ?
@@ -614,7 +1039,6 @@ app.get('/api/profile', authenticateToken(), async (req, res) => {
             
             res.json(hospitals[0]);
         } else {
-            // Admin profile
             const [users] = await pool.execute(
                 'SELECT user_id, username, email, role, created_at FROM users WHERE user_id = ?',
                 [userId]
@@ -630,14 +1054,13 @@ app.get('/api/profile', authenticateToken(), async (req, res) => {
         console.error('Get profile error:', error);
         res.status(500).json({ error: 'Failed to fetch profile' });
     }
-});
+}));
 
 // 9. Get matches for current donor
-app.get('/api/my-matches', authenticateToken(['donor']), async (req, res) => {
+app.get('/api/my-matches', authenticateToken(['donor']), dbMiddleware(async (req, res) => {
     try {
         const userId = req.user.userId;
         
-        // Get donor ID from user ID
         const [donors] = await pool.execute(
             'SELECT donor_id FROM donors WHERE user_id = ?',
             [userId]
@@ -667,14 +1090,13 @@ app.get('/api/my-matches', authenticateToken(['donor']), async (req, res) => {
         console.error('Get my matches error:', error);
         res.status(500).json({ error: 'Failed to fetch matches' });
     }
-});
+}));
 
 // 10. Contact donor endpoint
-app.post('/api/contact-donor/:id', authenticateToken(['hospital', 'admin']), async (req, res) => {
+app.post('/api/contact-donor/:id', authenticateToken(['hospital', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const donorId = req.params.id;
         
-        // Get donor details
         const [donors] = await pool.execute(
             'SELECT full_name, phone, email FROM donors WHERE donor_id = ?',
             [donorId]
@@ -699,10 +1121,10 @@ app.post('/api/contact-donor/:id', authenticateToken(['hospital', 'admin']), asy
         console.error('Contact donor error:', error);
         res.status(500).json({ error: 'Failed to contact donor' });
     }
-});
+}));
 
 // 11. Get donors for a specific blood request
-app.get('/api/requests/:id/donors', authenticateToken(['hospital', 'admin']), async (req, res) => {
+app.get('/api/requests/:id/donors', authenticateToken(['hospital', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const requestId = req.params.id;
         
@@ -720,10 +1142,10 @@ app.get('/api/requests/:id/donors', authenticateToken(['hospital', 'admin']), as
         console.error('Get request donors error:', error);
         res.status(500).json({ error: 'Failed to fetch donors for request' });
     }
-});
+}));
 
 // 12. Get all blood groups
-app.get('/api/blood-groups', authenticateToken(), async (req, res) => {
+app.get('/api/blood-groups', authenticateToken(), dbMiddleware(async (req, res) => {
     try {
         const [groups] = await pool.execute(
             `SELECT blood_group, COUNT(*) as count
@@ -736,15 +1158,14 @@ app.get('/api/blood-groups', authenticateToken(), async (req, res) => {
         console.error('Get blood groups error:', error);
         res.status(500).json({ error: 'Failed to fetch blood groups' });
     }
-});
+}));
 
 // 13. Update donor profile
-app.put('/api/profile', authenticateToken(['donor']), async (req, res) => {
+app.put('/api/profile', authenticateToken(['donor']), dbMiddleware(async (req, res) => {
     try {
         const userId = req.user.userId;
         const { availability_status, last_donation_date } = req.body;
         
-        // Get donor ID from user ID
         const [donors] = await pool.execute(
             'SELECT donor_id FROM donors WHERE user_id = ?',
             [userId]
@@ -785,14 +1206,13 @@ app.put('/api/profile', authenticateToken(['donor']), async (req, res) => {
         console.error('Update profile error:', error);
         res.status(500).json({ error: 'Failed to update profile' });
     }
-});
+}));
 
-// 14. DONATION HISTORY ROUTES (NEW)
-app.get('/api/donation-history/:donorId', authenticateToken(['donor', 'admin']), async (req, res) => {
+// 14. DONATION HISTORY ROUTES
+app.get('/api/donation-history/:donorId', authenticateToken(['donor', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const donorId = req.params.donorId;
         
-        // Get donation history
         const [donations] = await pool.execute(
             `SELECT dh.*, h.hospital_name, br.blood_group, br.urgency_level
              FROM donation_history dh
@@ -803,19 +1223,17 @@ app.get('/api/donation-history/:donorId', authenticateToken(['donor', 'admin']),
             [donorId]
         );
         
-        // Get statistics
         const [stats] = await pool.execute(
-            `SELECT 
+            `SELECT
                COUNT(*) as totalDonations,
                MAX(donation_date) as lastDonation,
                DATEDIFF(CURDATE(), MAX(donation_date)) as daysSinceLast,
                SUM(quantity_units) as totalUnits
-             FROM donation_history 
+             FROM donation_history
              WHERE donor_id = ?`,
             [donorId]
         );
         
-        // Calculate lives saved (estimate: 3 lives per donation)
         const totalDonations = stats[0]?.totalDonations || 0;
         const livesSaved = totalDonations * 3;
         
@@ -833,14 +1251,14 @@ app.get('/api/donation-history/:donorId', authenticateToken(['donor', 'admin']),
         console.error('Get donation history error:', error);
         res.status(500).json({ error: 'Failed to fetch donation history' });
     }
-});
+}));
 
-app.post('/api/donation-history', authenticateToken(['hospital', 'admin']), async (req, res) => {
+app.post('/api/donation-history', authenticateToken(['hospital', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const { donor_id, request_id, hospital_id, quantity_units, notes } = req.body;
         
         const [result] = await pool.execute(
-            `INSERT INTO donation_history 
+            `INSERT INTO donation_history
              (donor_id, request_id, hospital_id, donation_date, quantity_units, notes)
              VALUES (?, ?, ?, CURDATE(), ?, ?)`,
             [donor_id, request_id, hospital_id, quantity_units || 1, notes || '']
@@ -855,13 +1273,12 @@ app.post('/api/donation-history', authenticateToken(['hospital', 'admin']), asyn
         console.error('Add donation history error:', error);
         res.status(500).json({ error: 'Failed to record donation' });
     }
-});
+}));
 
-app.put('/api/matches/:id/complete', authenticateToken(['hospital', 'donor', 'admin']), async (req, res) => {
+app.put('/api/matches/:id/complete', authenticateToken(['hospital', 'donor', 'admin']), dbMiddleware(async (req, res) => {
     try {
         const matchId = req.params.id;
         
-        // Get match details
         const [matches] = await pool.execute(
             `SELECT m.*, br.hospital_id, br.quantity_units, d.donor_id, br.request_id
              FROM matching m
@@ -877,42 +1294,39 @@ app.put('/api/matches/:id/complete', authenticateToken(['hospital', 'donor', 'ad
         
         const match = matches[0];
         
-        // Update match status
         await pool.execute(
             `UPDATE matching SET match_status = 'completed' WHERE match_id = ?`,
             [matchId]
         );
         
-        // Add to donation history
         await pool.execute(
-            `INSERT INTO donation_history 
+            `INSERT INTO donation_history
              (donor_id, request_id, hospital_id, donation_date, quantity_units)
              VALUES (?, ?, ?, CURDATE(), ?)`,
             [match.donor_id, match.request_id, match.hospital_id, match.quantity_units]
         );
         
-        // Update donor's last donation date
         await pool.execute(
-            `UPDATE donors 
-             SET last_donation_date = CURDATE(), 
+            `UPDATE donors
+             SET last_donation_date = CURDATE(),
                  availability_status = 'recently_donated'
              WHERE donor_id = ?`,
             [match.donor_id]
         );
         
-        res.json({ 
+        res.json({
             message: 'Donation completed and recorded in history',
-            donationRecorded: true 
+            donationRecorded: true
         });
         
     } catch (error) {
         console.error('Complete donation error:', error);
         res.status(500).json({ error: 'Failed to complete donation' });
     }
-});
+}));
 
 // 15. Get all donations for admin
-app.get('/api/admin/donations', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/donations', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { start_date, end_date } = req.query;
         
@@ -945,14 +1359,13 @@ app.get('/api/admin/donations', authenticateToken(['admin']), async (req, res) =
         console.error('Get admin donations error:', error);
         res.status(500).json({ error: 'Failed to fetch donations' });
     }
-});
+}));
 
 // 16. Admin User Management
-app.post('/api/admin/users', authenticateToken(['admin']), async (req, res) => {
+app.post('/api/admin/users', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { username, email, password, role, is_active } = req.body;
         
-        // Check if user exists
         const [existingUsers] = await pool.execute(
             'SELECT user_id FROM users WHERE email = ? OR username = ?',
             [email, username]
@@ -962,11 +1375,9 @@ app.post('/api/admin/users', authenticateToken(['admin']), async (req, res) => {
             return res.status(400).json({ error: 'User already exists' });
         }
         
-        // Hash password
         const salt = await bcrypt.genSalt(10);
         const passwordHash = await bcrypt.hash(password, salt);
         
-        // Create user
         const [result] = await pool.execute(
             'INSERT INTO users (username, email, password_hash, role, is_active) VALUES (?, ?, ?, ?, ?)',
             [username, email, passwordHash, role, is_active || true]
@@ -981,9 +1392,9 @@ app.post('/api/admin/users', authenticateToken(['admin']), async (req, res) => {
         console.error('Create user error:', error);
         res.status(500).json({ error: 'Failed to create user' });
     }
-});
+}));
 
-app.put('/api/admin/users/:id', authenticateToken(['admin']), async (req, res) => {
+app.put('/api/admin/users/:id', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { role, is_active } = req.body;
         
@@ -998,10 +1409,10 @@ app.put('/api/admin/users/:id', authenticateToken(['admin']), async (req, res) =
         console.error('Update user error:', error);
         res.status(500).json({ error: 'Failed to update user' });
     }
-});
+}));
 
 // 17. Admin Donor Management
-app.post('/api/admin/donors', authenticateToken(['admin']), async (req, res) => {
+app.post('/api/admin/donors', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { user_id, full_name, gender, date_of_birth, blood_group, phone, email, address, availability_status } = req.body;
         
@@ -1020,22 +1431,19 @@ app.post('/api/admin/donors', authenticateToken(['admin']), async (req, res) => 
         console.error('Create donor error:', error);
         res.status(500).json({ error: 'Failed to create donor' });
     }
-});
+}));
 
-app.delete('/api/admin/donors/:id', authenticateToken(['admin']), async (req, res) => {
+app.delete('/api/admin/donors/:id', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
-        // Get user_id first
         const [donors] = await pool.execute(
             'SELECT user_id FROM donors WHERE donor_id = ?',
             [req.params.id]
         );
         
         if (donors.length > 0) {
-            // Delete user account as well
             await pool.execute('DELETE FROM users WHERE user_id = ?', [donors[0].user_id]);
         }
         
-        // Delete donor (cascade will handle related records)
         await pool.execute('DELETE FROM donors WHERE donor_id = ?', [req.params.id]);
         
         res.json({ message: 'Donor deleted successfully' });
@@ -1044,10 +1452,10 @@ app.delete('/api/admin/donors/:id', authenticateToken(['admin']), async (req, re
         console.error('Delete donor error:', error);
         res.status(500).json({ error: 'Failed to delete donor' });
     }
-});
+}));
 
 // 18. Admin Hospital Management
-app.post('/api/admin/hospitals', authenticateToken(['admin']), async (req, res) => {
+app.post('/api/admin/hospitals', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { user_id, hospital_name, location, contact_phone, email } = req.body;
         
@@ -1066,9 +1474,9 @@ app.post('/api/admin/hospitals', authenticateToken(['admin']), async (req, res) 
         console.error('Create hospital error:', error);
         res.status(500).json({ error: 'Failed to create hospital' });
     }
-});
+}));
 
-app.put('/api/admin/hospitals/:id', authenticateToken(['admin']), async (req, res) => {
+app.put('/api/admin/hospitals/:id', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { hospital_name, location, contact_phone, email } = req.body;
         
@@ -1083,22 +1491,19 @@ app.put('/api/admin/hospitals/:id', authenticateToken(['admin']), async (req, re
         console.error('Update hospital error:', error);
         res.status(500).json({ error: 'Failed to update hospital' });
     }
-});
+}));
 
-app.delete('/api/admin/hospitals/:id', authenticateToken(['admin']), async (req, res) => {
+app.delete('/api/admin/hospitals/:id', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
-        // Get user_id first
         const [hospitals] = await pool.execute(
             'SELECT user_id FROM hospitals WHERE hospital_id = ?',
             [req.params.id]
         );
         
         if (hospitals.length > 0) {
-            // Delete user account as well
             await pool.execute('DELETE FROM users WHERE user_id = ?', [hospitals[0].user_id]);
         }
         
-        // Delete hospital (cascade will handle related records)
         await pool.execute('DELETE FROM hospitals WHERE hospital_id = ?', [req.params.id]);
         
         res.json({ message: 'Hospital deleted successfully' });
@@ -1107,15 +1512,14 @@ app.delete('/api/admin/hospitals/:id', authenticateToken(['admin']), async (req,
         console.error('Delete hospital error:', error);
         res.status(500).json({ error: 'Failed to delete hospital' });
     }
-});
+}));
 
 // 19. System Management Endpoints
-app.post('/api/admin/clear-old-requests', authenticateToken(['admin']), async (req, res) => {
+app.post('/api/admin/clear-old-requests', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
-        // Delete completed requests older than 30 days
         await pool.execute(
-            `DELETE FROM blood_requests 
-             WHERE status = 'fulfilled' 
+            `DELETE FROM blood_requests
+             WHERE status = 'fulfilled'
              AND request_date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)`
         );
         
@@ -1125,19 +1529,18 @@ app.post('/api/admin/clear-old-requests', authenticateToken(['admin']), async (r
         console.error('Clear old requests error:', error);
         res.status(500).json({ error: 'Failed to clear old requests' });
     }
-});
+}));
 
-app.get('/api/admin/generate-report', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/generate-report', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
-        // Generate report data
         const [
-            [totalStats],
+            [[totalStats]],
             bloodGroupStats,
-            [recentDonations],
-            [activeHospitals]
+            [[recentDonations]],
+            [[activeHospitals]]
         ] = await Promise.all([
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(DISTINCT d.donor_id) as total_donors,
                   COUNT(DISTINCT h.hospital_id) as total_hospitals,
                   COUNT(DISTINCT br.request_id) as total_requests,
@@ -1152,19 +1555,17 @@ app.get('/api/admin/generate-report', authenticateToken(['admin']), async (req, 
             pool.execute('SELECT COUNT(*) as count FROM donation_history WHERE donation_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'),
             pool.execute('SELECT COUNT(DISTINCT hospital_id) as count FROM blood_requests WHERE request_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)')
         ]);
-        
+
         const reportData = {
             generated_at: new Date().toISOString(),
             statistics: totalStats,
             blood_groups: bloodGroupStats,
             recent_activity: {
-                donations_last_week: recentDonations.count,
-                active_hospitals: activeHospitals.count
+                donations_last_week: recentDonations,
+                active_hospitals: activeHospitals
             }
         };
         
-        // In a real application, you would generate a PDF here
-        // For now, return JSON
         res.json({
             message: 'Report generated successfully',
             report: reportData,
@@ -1175,19 +1576,16 @@ app.get('/api/admin/generate-report', authenticateToken(['admin']), async (req, 
         console.error('Generate report error:', error);
         res.status(500).json({ error: 'Failed to generate report' });
     }
-});
+}));
 
-app.post('/api/admin/backup-database', authenticateToken(['admin']), async (req, res) => {
+app.post('/api/admin/backup-database', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
-        // In a real application, you would perform database backup here
-        // This is a mock implementation
-        
         const backupInfo = {
             timestamp: new Date().toISOString(),
             backup_id: 'backup_' + Date.now(),
             status: 'completed',
             file_size: '~5MB',
-            download_url: null // In production, this would be a real URL
+            download_url: null
         };
         
         res.json({
@@ -1199,23 +1597,23 @@ app.post('/api/admin/backup-database', authenticateToken(['admin']), async (req,
         console.error('Backup database error:', error);
         res.status(500).json({ error: 'Failed to backup database' });
     }
-});
+}));
 
 // 20. Get detailed admin statistics
-app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/statistics', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const [
-            [userStats],
-            [donorStats],
-            [hospitalStats],
-            [requestStats],
-            [donationStats],
+            [[userStats]],
+            [[donorStats]],
+            [[hospitalStats]],
+            [[requestStats]],
+            [[donationStats]],
             monthlyStats,
             topDonors,
             topHospitals
         ] = await Promise.all([
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(*) as total_users,
                   COUNT(CASE WHEN role = 'admin' THEN 1 END) as admin_users,
                   COUNT(CASE WHEN role = 'hospital' THEN 1 END) as hospital_users,
@@ -1224,7 +1622,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 FROM users
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(*) as total_donors,
                   COUNT(CASE WHEN availability_status = 'available' THEN 1 END) as available_donors,
                   COUNT(CASE WHEN availability_status = 'unavailable' THEN 1 END) as unavailable_donors,
@@ -1232,13 +1630,13 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 FROM donors
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(*) as total_hospitals,
                   COUNT(DISTINCT location) as locations
                 FROM hospitals
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(*) as total_requests,
                   COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_requests,
                   COUNT(CASE WHEN status = 'matched' THEN 1 END) as matched_requests,
@@ -1247,7 +1645,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 FROM blood_requests
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   COUNT(*) as total_donations,
                   SUM(quantity_units) as total_units,
                   COUNT(DISTINCT donor_id) as unique_donors,
@@ -1255,7 +1653,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 FROM donation_history
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   DATE_FORMAT(donation_date, '%Y-%m') as month,
                   COUNT(*) as donations,
                   SUM(quantity_units) as units
@@ -1265,7 +1663,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 ORDER BY month DESC
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   d.full_name,
                   d.blood_group,
                   COUNT(dh.donation_id) as total_donations,
@@ -1277,7 +1675,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 LIMIT 10
             `),
             pool.execute(`
-                SELECT 
+                SELECT
                   h.hospital_name,
                   COUNT(br.request_id) as total_requests,
                   COUNT(CASE WHEN br.status = 'fulfilled' THEN 1 END) as fulfilled_requests
@@ -1288,7 +1686,7 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
                 LIMIT 10
             `)
         ]);
-        
+
         res.json({
             users: userStats,
             donors: donorStats,
@@ -1304,10 +1702,10 @@ app.get('/api/admin/statistics', authenticateToken(['admin']), async (req, res) 
         console.error('Get admin statistics error:', error);
         res.status(500).json({ error: 'Failed to fetch statistics' });
     }
-});
+}));
 
 // 21. Get all blood requests for admin
-app.get('/api/admin/requests', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/requests', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const { status, start_date, end_date } = req.query;
         
@@ -1346,19 +1744,19 @@ app.get('/api/admin/requests', authenticateToken(['admin']), async (req, res) =>
         console.error('Get admin requests error:', error);
         res.status(500).json({ error: 'Failed to fetch requests' });
     }
-});
+}));
 
 // 22. Admin dashboard extended stats
-app.get('/api/admin/dashboard-stats', authenticateToken(['admin']), async (req, res) => {
+app.get('/api/admin/dashboard-stats', authenticateToken(['admin']), dbMiddleware(async (req, res) => {
     try {
         const [
-            [totalUsers],
-            [totalDonors],
-            [totalHospitals],
-            [totalRequests],
-            [pendingRequests],
-            [completedRequests],
-            [totalDonations],
+            [[totalUsers]],
+            [[totalDonors]],
+            [[totalHospitals]],
+            [[totalRequests]],
+            [[pendingRequests]],
+            [[completedRequests]],
+            [[totalDonations]],
             bloodGroupStats,
             monthlyStats,
             topHospitals,
@@ -1399,7 +1797,7 @@ app.get('/api/admin/dashboard-stats', authenticateToken(['admin']), async (req, 
                 LIMIT 5
             `)
         ]);
-        
+
         res.json({
             totalUsers: totalUsers.count,
             totalDonors: totalDonors.count,
@@ -1417,34 +1815,39 @@ app.get('/api/admin/dashboard-stats', authenticateToken(['admin']), async (req, 
         console.error('Get admin dashboard stats error:', error);
         res.status(500).json({ error: 'Failed to fetch dashboard statistics' });
     }
-});
+}));
 
-// Test endpoint
-app.get('/api/test', (req, res) => {
-    res.json({ message: 'API is working!' });
-});
-
-// Health check
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+// 404 handler
+app.use('*', (req, res) => {
+    res.status(404).json({
+        error: 'Route not found',
+        message: `Cannot ${req.method} ${req.originalUrl}`,
+        availableEndpoints: [
+            '/api',
+            '/api/health',
+            '/api/test',
+            '/api/test-db',
+            '/api/debug',
+            '/api/auth/register',
+            '/api/auth/login',
+            '/api/profile',
+            '/api/donors',
+            '/api/hospitals',
+            '/api/blood-requests',
+            '/api/matches'
+        ]
+    });
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ error: 'Something went wrong!' });
+    console.error('Server error:', err.message);
+    res.status(500).json({
+        error: 'Internal server error',
+        message: isProduction ? 'Something went wrong. Please try again later.' : err.message,
+        timestamp: new Date().toISOString()
+    });
 });
 
-// 404 handler
-app.use('*', (req, res) => {
-    res.status(404).json({ error: 'Route not found' });
-});
-
-// Start server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-   
-    console.log(`🌐 Frontend: http://localhost:5173`);
- 
-});
+// Initialize the application
+initializeApp();
